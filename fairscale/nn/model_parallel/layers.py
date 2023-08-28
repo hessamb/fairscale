@@ -370,7 +370,7 @@ class RowParallelLinear(torch.nn.Module):
     def get_master_weight(self) -> torch.Tensor:
         return gather_from_model_parallel_region(self.weight.data)
 
-    def forward(self, input_: torch.Tensor) -> torch.Tensor:  # type:ignore
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:  # type: ignore
         # Set up backprop all-reduce.
         if self.input_is_parallel:
             input_parallel = input_
