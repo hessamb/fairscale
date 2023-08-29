@@ -24,7 +24,7 @@
 # repo: https://github.com/pytorch/pytorch
 
 
-from typing import Callable, Optional
+from typing import Callable, Final, Optional
 
 import torch
 import torch.nn.functional as F
@@ -159,6 +159,7 @@ class ParallelEmbedding(torch.nn.Module):
         embedding_dim: size of hidden state.
         init_method: method to initialize weights.
     """
+    world_size: Final[int]
 
     def __init__(
         self,
@@ -183,8 +184,8 @@ class ParallelEmbedding(torch.nn.Module):
         self.sparse = sparse
         self._weight = None
         # Divide the weight matrix along the embedding dimension.
-        world_size = get_model_parallel_world_size()
-        self.embedding_dim_per_partition = divide_and_check_no_remainder(self.embedding_dim, world_size)
+        self.world_size = get_model_parallel_world_size()
+        self.embedding_dim_per_partition = divide_and_check_no_remainder(self.embedding_dim, self.world_size)
 
         # Allocate weights.
         self.weight = Parameter(torch.Tensor(self.num_embeddings, self.embedding_dim_per_partition))
@@ -201,7 +202,10 @@ class ParallelEmbedding(torch.nn.Module):
         )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:  # type: ignore
-        input_parallel = copy_to_model_parallel_region(input_)
+        if self.world_size > 1:
+            input_parallel = copy_to_model_parallel_region(input_)
+        else:
+            input_parallel = input_
         output_parallel = F.embedding(
             input_parallel,
             self.weight,
@@ -211,7 +215,10 @@ class ParallelEmbedding(torch.nn.Module):
             self.scale_grad_by_freq,
             self.sparse,
         )
-        output = gather_from_model_parallel_region(output_parallel)
+        if self.world_size > 1:
+            output = gather_from_model_parallel_region(output_parallel)
+        else:
+            output = output_parallel
         return output
 
 
@@ -235,6 +242,7 @@ class ColumnParallelLinear(torch.nn.Module):
                                      set to False. It returns the master weights
                                      used for initialization.
     """
+    world_size: Final[int]
 
     def __init__(
         self,
@@ -253,8 +261,8 @@ class ColumnParallelLinear(torch.nn.Module):
         self.out_features = out_features
         self.gather_output = gather_output
         # Divide the weight matrix along the last dimension.
-        world_size = get_model_parallel_world_size()
-        self.output_size_per_partition = divide_and_check_no_remainder(out_features, world_size)
+        self.world_size = get_model_parallel_world_size()
+        self.output_size_per_partition = divide_and_check_no_remainder(out_features, self.world_size)
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -284,11 +292,14 @@ class ColumnParallelLinear(torch.nn.Module):
         return gather_from_model_parallel_region(self.weight.data.transpose(0, 1)).transpose_(0, 1)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:  # type: ignore
-        # Set up backprop all-reduce.
-        input_parallel = copy_to_model_parallel_region(input_)
+        if self.world_size > 1:
+            # Set up backprop all-reduce.
+            input_parallel = copy_to_model_parallel_region(input_)
+        else:
+            input_parallel = input_
         # Matrix multiply.
         output_parallel = F.linear(input_parallel, self.weight, self.bias)
-        if self.gather_output:
+        if self.gather_output and self.world_size > 1:
             # All-gather across the partitions.
             output = gather_from_model_parallel_region(output_parallel)
         else:
@@ -322,6 +333,7 @@ class RowParallelLinear(torch.nn.Module):
                                      set to False. It returns the master weights
                                      used for initialization.
     """
+    world_size: Final[int]
 
     def __init__(
         self,
@@ -340,8 +352,8 @@ class RowParallelLinear(torch.nn.Module):
         self.out_features = out_features
         self.input_is_parallel = input_is_parallel
         # Divide the weight matrix along the last dimension.
-        world_size = get_model_parallel_world_size()
-        self.input_size_per_partition = divide_and_check_no_remainder(in_features, world_size)
+        self.world_size = get_model_parallel_world_size()
+        self.input_size_per_partition = divide_and_check_no_remainder(in_features, self.world_size)
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -372,14 +384,17 @@ class RowParallelLinear(torch.nn.Module):
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:  # type: ignore
         # Set up backprop all-reduce.
-        if self.input_is_parallel:
+        if self.input_is_parallel or self.world_size == 1:
             input_parallel = input_
         else:
             input_parallel = scatter_to_model_parallel_region(input_)
         # Matrix multiply.
         output_parallel = F.linear(input_parallel, self.weight)
-        # All-reduce across all the partitions.
-        output_ = reduce_from_model_parallel_region(output_parallel)
+        if self.world_size > 1:
+            # All-reduce across all the partitions.
+            output_ = reduce_from_model_parallel_region(output_parallel)
+        else:
+            output_ = output_parallel
         if self.bias is not None:
             output = output_ + self.bias
         else:
